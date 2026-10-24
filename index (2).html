@@ -1,0 +1,2044 @@
+#!/data/data/com.termux/files/usr/bin/bash
+''''echo
+# =====================================================================
+#   H Y P E R   S N A K E   ·   Termux Edition
+#   Один файл = bash + python3 + HTML5 (полиглот)
+#
+#   Запуск в Termux:      bash snake.py
+#   Браузерная версия:    python3 snake.py --web
+#   Проверка компонентов: python3 snake.py --check
+#
+#   Перед запуском скрипт ПРОВЕРЯЕТ каждый компонент и ставит его
+#   только если его нет (pkg install -y ...).
+# =====================================================================
+if command -v python3 >/dev/null 2>&1; then
+  echo "[ ok ] python3 найден"
+else
+  echo "[ .. ] python3 отсутствует -> ставлю"
+  if command -v pkg >/dev/null 2>&1; then
+    pkg install -y python || { echo "[ !! ] не удалось поставить python3"; exit 1; }
+  else
+    echo "[ !! ] pkg не найден, а python3 нужен для запуска"; exit 1
+  fi
+fi
+exec python3 "$0" "$@"
+exit 0
+# '''
+
+import atexit, json, math, os, random, select, shutil, signal, subprocess, sys, termios, time
+
+ESC = chr(27)
+HALF = chr(0x2580)          # верхний полублок: 2 пикселя на символ
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCOREFILE = os.path.join(os.path.expanduser('~'), '.hyper_snake.json')
+IS_TERMUX = os.path.isdir('/data/data/com.termux') or 'TERMUX_VERSION' in os.environ
+
+HELP = """HYPER SNAKE -- гиперреалистичная змейка одним файлом
+
+  bash snake.py                 играть в терминале (Termux)
+  python3 snake.py              то же самое
+  python3 snake.py --web        отдать HTML5-версию в браузер Android
+  python3 snake.py --save-html f.html   просто сохранить HTML5-версию
+  python3 snake.py --check      только проверить компоненты
+  python3 snake.py --no-install не ставить ничего (только проверить)
+  python3 snake.py --wrap       стены проходимы (режим тор)
+
+Управление: стрелки / WASD / hjkl · SPACE пауза · R заново · Q выход · +,- скорость"""
+
+# ============================ 1. КОМПОНЕНТЫ ============================
+COMPONENTS = [
+    dict(id='python3',       kind='bin', probe='python3',        pkg='python',        need=True,  about='интерпретатор'),
+    dict(id='ncurses-utils', kind='bin', probe='tput',           pkg='ncurses-utils', need=False, about='цвета и размер терминала'),
+    dict(id='termux-tools',  kind='bin', probe='termux-info',    pkg='termux-tools',  need=False, about='утилиты Termux'),
+    dict(id='termux-api',    kind='bin', probe='termux-vibrate', pkg='termux-api',    need=False, about='вибрация при поедании'),
+    dict(id='numpy',         kind='py',  probe='numpy',          pkg='python-numpy',  need=False, about='мягкое размытие фона'),
+]
+
+
+def probe(kind, name):
+    if kind == 'bin':
+        return shutil.which(name) is not None
+    try:
+        import importlib.util
+        return importlib.util.find_spec(name) is not None
+    except Exception:
+        return False
+
+
+def _say(sym, code, txt):
+    if sys.stdout.isatty():
+        print('  ' + ESC + '[1;' + code + 'm' + sym + ESC + '[0m ' + txt, flush=True)
+    else:
+        print('  [' + sym + '] ' + txt, flush=True)
+
+
+def bootstrap(mode='auto'):
+    """mode: auto | check | skip  -- проверяем ПЕРЕД установкой."""
+    if sys.stdout.isatty():
+        print(ESC + '[1;97;44m HYPER SNAKE ' + ESC + '[0m ' + ESC + '[1;37;40m проверка компонентов ' + ESC + '[0m', flush=True)
+    else:
+        print('HYPER SNAKE -- проверка компонентов', flush=True)
+    have_pkg = shutil.which('pkg') is not None
+    missing = []
+    for c in COMPONENTS:
+        ok = probe(c['kind'], c['probe'])
+        if ok:
+            _say('ok', '32', '%-14s %s' % (c['id'], c['about']))
+            continue
+        if mode == 'skip':
+            _say('skip', '33', '%-14s %s  (установка отключена)' % (c['id'], c['about']))
+            continue
+        if mode == 'check':
+            _say('MISSING', '31', '%-14s %s' % (c['id'], c['about']))
+            missing.append(c)
+            continue
+        if not have_pkg:
+            _say('skip', '33', '%-14s %s  (нет pkg -> вне Termux)' % (c['id'], c['about']))
+            continue
+        _say('get', '36', '%-14s %s  ->  pkg install -y %s' % (c['id'], c['about'], c['pkg']))
+        rc = subprocess.call(['pkg', 'install', '-y', c['pkg']])
+        if rc == 0 and probe(c['kind'], c['probe']):
+            _say('ok', '32', '%-14s установлено' % c['id'])
+        else:
+            if c['need']:
+                _say('FAIL', '31', '%-14s обязательный компонент не установлен' % c['id'])
+                return False
+            _say('skip', '33', '%-14s не поставился, обойдёмся без него' % c['id'])
+    if mode == 'check':
+        print()
+        if missing:
+            print('  отсутствует: ' + ', '.join(c['id'] for c in missing))
+        else:
+            print('  все компоненты на месте.')
+        return True
+    if sys.stdout.isatty():
+        print(ESC + '[1;32m  все проверки пройдены, запускаю' + ESC + '[0m', flush=True)
+    time.sleep(0.25)
+    return True
+
+
+def vibrate(ms=30):
+    if shutil.which('termux-vibrate'):
+        try:
+            subprocess.Popen(['termux-vibrate', '-d', str(ms)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+# ============================ 2. СПРАЙТЫ ============================
+class Sprites:
+    """Кэш шейдерных спрайтов: освещённые сферы, свечения, кольца."""
+
+    def __init__(self):
+        self._sph, self._glow, self._ring = {}, {}, {}
+
+    def sphere(self, r, rgb, spec=0.45, k0=0.26):
+        r = max(1, int(r))
+        key = (r, rgb, round(spec, 2), round(k0, 2))
+        s = self._sph.get(key)
+        if s is not None:
+            return s
+        lx, ly, lz = -0.42, -0.58, 0.70
+        n = math.sqrt(lx * lx + ly * ly + lz * lz)
+        lx, ly, lz = lx / n, ly / n, lz / n
+        R, G, B = rgb
+        rr = float(r * r)
+        out = []
+        for y in range(-r, r + 1):
+            for x in range(-r, r + 1):
+                q = (x * x + y * y) / rr
+                if q >= 1.0:
+                    out.append(None)
+                    continue
+                nx, ny = x / float(r), y / float(r)
+                nz = math.sqrt(max(0.0, 1.0 - nx * nx - ny * ny))
+                dif = nx * lx + ny * ly + nz * lz
+                if dif < 0.0:
+                    dif = 0.0
+                sp = dif ** 16
+                k = k0 + (1.0 - k0) * dif
+                out.append(((min(255, int(R * k + 250 * sp * spec)),
+                             min(255, int(G * k + 250 * sp * spec)),
+                             min(255, int(B * k + 250 * sp * spec))),
+                            1.0 if q < 0.78 else max(0.0, 1.0 - (q - 0.78) / 0.22)))
+        res = (2 * r + 1, out)
+        self._sph[key] = res
+        return res
+
+    def glow(self, R):
+        R = max(1, int(R))
+        s = self._glow.get(R)
+        if s is not None:
+            return s
+        rr = float(R * R)
+        out = []
+        for y in range(-R, R + 1):
+            for x in range(-R, R + 1):
+                d = (x * x + y * y) / rr
+                out.append(0.0 if d >= 1.0 else (1.0 - d) ** 2)
+        res = (2 * R + 1, out)
+        self._glow[R] = res
+        return res
+
+    def ring(self, R):
+        R = max(2, int(R))
+        s = self._ring.get(R)
+        if s is not None:
+            return s
+        rr = float(R * R)
+        w = max(0.6, R * 0.35)
+        out = []
+        for y in range(-R, R + 1):
+            for x in range(-R, R + 1):
+                d = math.sqrt(x * x + y * y)
+                out.append(math.exp(-((d - R) ** 2) / (2 * w * w)))
+        res = (2 * R + 1, out)
+        self._ring[R] = res
+        return res
+
+
+def compose(dst, dd, cx, cy, spr, mul=1.0):
+    """наложить спрайт на спрайт (для сборки яблока)."""
+    sd, spx = spr
+    sr = sd >> 1
+    for yy in range(sd):
+        Y = cy - sr + yy
+        if Y < 0 or Y >= dd:
+            continue
+        for xx in range(sd):
+            p = spx[yy * sd + xx]
+            if p is None:
+                continue
+            X = cx - sr + xx
+            if X < 0 or X >= dd:
+                continue
+            c, a = p
+            a = a * mul
+            i = Y * dd + X
+            q = dst[i]
+            if q is None:
+                dst[i] = (c, a)
+            else:
+                dst[i] = (c, max(a, q[1] * 0.55))
+
+
+def apple_sprite(spr, R):
+    R = max(3, int(R))
+    d = 2 * R + 4
+    buf = [None] * (d * d)
+    c = R + 2
+    compose(buf, d, c, c, spr.sphere(R, (208, 44, 44), 0.9, 0.20))
+    compose(buf, d, c - int(R * 0.28), c - int(R * 0.34), spr.sphere(max(1, int(R * 0.30)), (255, 236, 226), 0.55, 0.6))
+    compose(buf, d, c + int(R * 0.12), c + int(R * 0.42), spr.sphere(max(1, int(R * 0.24)), (120, 12, 12), 0.1, 0.15))
+    for i in range(int(R * 0.55) + 1):
+        Y = c - R - i
+        if 0 <= Y < d:
+            buf[Y * d + c] = ((104, 68, 34), 1.0)
+    compose(buf, d, c + int(R * 0.62), c - R + 1, spr.sphere(max(1, int(R * 0.32)), (96, 196, 74), 0.6, 0.4))
+    return (d, buf)
+
+
+# ============================ 3. ЭКРАН ============================
+FGC, BGC = {}, {}
+
+
+def idx256(v):
+    r, g, b = (v >> 16) & 255, (v >> 8) & 255, v & 255
+    return 16 + 36 * (r * 6 // 256) + 6 * (g * 6 // 256) + (b * 6 // 256)
+
+
+def sgr_fg(tc, v):
+    s = FGC.get(v)
+    if s is None:
+        if tc:
+            s = ESC + '[38;2;%d;%d;%dm' % ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+        else:
+            s = ESC + '[38;5;%dm' % idx256(v)
+        FGC[v] = s
+    return s
+
+
+def sgr_bg(tc, v):
+    s = BGC.get(v)
+    if s is None:
+        if tc:
+            s = ESC + '[48;2;%d;%d;%dm' % ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+        else:
+            s = ESC + '[48;5;%dm' % idx256(v)
+        BGC[v] = s
+    return s
+
+
+class Field:
+    """Пиксельный фреймбуфер: PW x PH пикселей, 2 пикселя на символ."""
+
+    def __init__(self, cols, rows, spr):
+        self.COLS, self.ROWS = cols, rows
+        self.PW, self.PH = cols, rows * 2
+        self.spr = spr
+        self.buf = [0] * (self.PW * self.PH)
+        self.prev = [-1] * (self.PW * self.PH)
+
+    def clear(self, bg):
+        if len(bg) == len(self.buf):
+            self.buf[:] = bg
+
+    def blend(self, x, y, spr, mul=1.0):
+        d, px = spr
+        r = d >> 1
+        x, y = int(x), int(y)
+        x0, y0 = x - r, y - r
+        sx = -x0 if x0 < 0 else 0
+        sy = -y0 if y0 < 0 else 0
+        if x0 < 0:
+            x0 = 0
+        if y0 < 0:
+            y0 = 0
+        x1, y1 = x + r + 1, y + r + 1
+        if x1 > self.PW:
+            x1 = self.PW
+        if y1 > self.PH:
+            y1 = self.PH
+        buf, PW = self.buf, self.PW
+        for yy in range(y0, y1):
+            row = yy * PW
+            prow = (yy - y + r) * d
+            base = prow - x + r
+            for xx in range(x0, x1):
+                p = px[base + xx]
+                if p is None:
+                    continue
+                c, a = p
+                a = mul if a >= 1.0 else a * mul
+                if a <= 0.03:
+                    continue
+                i = row + xx
+                v = buf[i]
+                cr, cg, cb = c
+                buf[i] = ((int(((v >> 16) & 255) + (cr - ((v >> 16) & 255)) * a) << 16) |
+                          (int(((v >> 8) & 255) + (cg - ((v >> 8) & 255)) * a) << 8) |
+                          int((v & 255) + (cb - (v & 255)) * a))
+
+    def add(self, x, y, glowspr, rgb, mul=1.0):
+        d, al = glowspr
+        r = d >> 1
+        x, y = int(x), int(y)
+        x0, y0 = x - r, y - r
+        if x0 < 0:
+            x0 = 0
+        if y0 < 0:
+            y0 = 0
+        x1, y1 = x + r + 1, y + r + 1
+        if x1 > self.PW:
+            x1 = self.PW
+        if y1 > self.PH:
+            y1 = self.PH
+        buf, PW = self.buf, self.PW
+        cr, cg, cb = rgb
+        for yy in range(y0, y1):
+            row = yy * PW
+            base = (yy - y + r) * d - x + r
+            for xx in range(x0, x1):
+                a = al[base + xx] * mul
+                if a < 0.02:
+                    continue
+                i = row + xx
+                v = buf[i]
+                buf[i] = ((min(255, ((v >> 16) & 255) + int(cr * a)) << 16) |
+                          (min(255, ((v >> 8) & 255) + int(cg * a)) << 8) |
+                          min(255, (v & 255) + int(cb * a)))
+
+    def dot(self, x, y, rgb, a=1.0):
+        x, y = int(x), int(y)
+        if x < 0 or y < 0 or x >= self.PW or y >= self.PH:
+            return
+        i = y * self.PW + x
+        v = self.buf[i]
+        cr, cg, cb = rgb
+        self.buf[i] = ((int(((v >> 16) & 255) + (cr - ((v >> 16) & 255)) * a) << 16) |
+                       (int(((v >> 8) & 255) + (cg - ((v >> 8) & 255)) * a) << 8) |
+                       int((v & 255) + (cb - (v & 255)) * a))
+
+    def present(self, tc):
+        out = []
+        ap = out.append
+        buf, PW, prev = self.buf, self.PW, self.prev
+        for cy in range(self.ROWS):
+            base = cy * 2 * PW
+            brow = cy * PW
+            lastx = -9
+            for cx in range(PW):
+                t = buf[base + cx]
+                b = buf[base + PW + cx]
+                key = (t << 24) | b
+                idx = brow + cx
+                if prev[idx] == key:
+                    continue
+                prev[idx] = key
+                if cx != lastx + 1:
+                    ap(ESC + '[%d;%dH' % (cy + 1, cx + 1))
+                if t == b:
+                    ap(sgr_bg(tc, t))
+                    ap(' ')
+                else:
+                    ap(sgr_fg(tc, t))
+                    ap(sgr_bg(tc, b))
+                    ap(HALF)
+                lastx = cx
+        if out:
+            sys.stdout.write(''.join(out))
+
+
+# ---------------------- фон: трава, камни, виньетка ----------------------
+def make_bg(PW, PH, wrap, use_numpy):
+    rnd = random.Random(20260214)
+    bg = [0] * (PW * PH)
+    for y in range(PH):
+        t = y / max(1, PH - 1)
+        base = (int(9 + 13 * t) << 16) | (int(24 + 26 * (1 - t)) << 8) | int(16 + 11 * t)
+        row = y * PW
+        for x in range(PW):
+            bg[row + x] = base
+    for _ in range(PW * PH // 5):
+        x, y = rnd.randrange(PW), rnd.randrange(PH)
+        k = rnd.uniform(0.72, 1.34)
+        v = bg[y * PW + x]
+        bg[y * PW + x] = (min(255, int(((v >> 16) & 255) * k)) << 16) | \
+                          (min(255, int(((v >> 8) & 255) * k)) << 8) | \
+                          min(255, int((v & 255) * k))
+    cx, cy = PW / 2.0, PH / 2.0
+    m = max(cx, cy)
+    for y in range(PH):
+        dy = (y - cy) / m
+        row = y * PW
+        for x in range(PW):
+            d = math.hypot((x - cx) / m, dy)
+            if d <= 0.5:
+                continue
+            k = max(0.34, 1.0 - (d - 0.5) * 1.05)
+            v = bg[row + x]
+            bg[row + x] = (int(((v >> 16) & 255) * k) << 16) | (int(((v >> 8) & 255) * k) << 8) | int((v & 255) * k)
+    if use_numpy:
+        try:
+            import numpy as np
+            a = np.array(bg, dtype=np.int32).reshape(PH, PW)
+            pad = np.pad(a, 1, mode='edge')
+            sm = (pad[:-2, :-2] + pad[:-2, 1:-1] + pad[:-2, 2:] +
+                  pad[1:-1, :-2] + a + pad[1:-1, 2:] +
+                  pad[2:, :-2] + pad[2:, 1:-1] + pad[2:, 2:])
+            # .tolist() -> обычные int Python: без np.int32 не будет
+            # переполнения в ключе кадра (t << 24) | b и «призрачных» клеток
+            bg = np.minimum(255, a // 2 + sm // 18).astype(np.int32).ravel().tolist()
+        except Exception:
+            pass
+    # камни
+    for _ in range(max(3, PW // 14)):
+        x, y = rnd.randrange(2, PW - 2), rnd.randrange(2, PH - 2)
+        r = rnd.uniform(1.1, 2.4)
+        g = rnd.choice([(84, 88, 92), (72, 78, 70), (96, 90, 78)])
+        for yy in range(int(y - r) - 1, int(y + r) + 2):
+            for xx in range(int(x - r) - 1, int(x + r) + 2):
+                if xx < 0 or yy < 0 or xx >= PW or yy >= PH:
+                    continue
+                q = ((xx - x) ** 2 + (yy - y) ** 2 * 2.1) / (r * r)
+                if q >= 1:
+                    continue
+                k = 0.45 + 0.7 * (1 - q)
+                i = yy * PW + xx
+                v = bg[i]
+                bg[i] = (min(255, int(((v >> 16) & 255) * (1 - 0.75) + g[0] * k * 0.75)) << 16) | \
+                        (min(255, int(((v >> 8) & 255) * (1 - 0.75) + g[1] * k * 0.75)) << 8) | \
+                        min(255, int((v & 255) * (1 - 0.75) + g[2] * k * 0.75))
+    if not wrap:
+        edge = (46, 74, 44)
+        for x in range(PW):
+            for y in (0, PH - 1):
+                k = 1.0 if (x + y) % 7 else 1.35
+                bg[y * PW + x] = (min(255, int(edge[0] * k)) << 16) | (min(255, int(edge[1] * k)) << 8) | min(255, int(edge[2] * k))
+        for y in range(PH):
+            for x in (0, PW - 1):
+                k = 1.0 if (x + y) % 7 else 1.35
+                bg[y * PW + x] = (min(255, int(edge[0] * k)) << 16) | (min(255, int(edge[1] * k)) << 8) | min(255, int(edge[2] * k))
+    return bg
+
+
+# ============================ 4. ИГРА ============================
+class Game:
+    def __init__(self, f, spr, bg, wrap=False):
+        self.f, self.spr, self.bg, self.wrap = f, spr, bg, wrap
+        self.score = 0
+        self.best = load_best()
+        self.parts = []
+        self.rings = []
+        self.pops = []
+        self.reset()
+
+    def reset(self):
+        PW, PH = self.f.PW, self.f.PH
+        self.CS = 4 if PW >= 52 else 3
+        self.T = self.CS * 0.92                     # толщина тела
+        self.speed = self.CS * 4.6
+        self.spd0 = self.speed
+        self.body_len = self.CS * 6.0
+        self.state = 'ready'
+        hx, hy = PW * 0.35, PH * 0.5
+        self.trail = [(hx - i * 0.7, hy) for i in range(90, -1, -1)]
+        self.hx, self.hy = hx, hy
+        self.dx, self.dy = 1.0, 0.0
+        self.q = []
+        self.turnpos = 0.0
+        self.dead_t = 0.0
+        self.eat_flash = 0.0
+        self.apple = apple_sprite(self.spr, max(3, int(self.CS * 0.95)))
+        self.spawn_food()
+        self.parts = []
+        self.rings = []
+        self.pops = []
+
+    # ---------------- геометрия (пункт 3: честный тор) ----------------
+    def wd(self, dx, dy):
+        """кратчайшая дельта между двумя точками; в режиме --wrap учитывает тороидальность."""
+        if self.wrap:
+            PW, PH = self.f.PW, self.f.PH
+            if dx > PW * 0.5:
+                dx -= PW
+            elif dx < -PW * 0.5:
+                dx += PW
+            if dy > PH * 0.5:
+                dy -= PH
+            elif dy < -PH * 0.5:
+                dy += PH
+        return dx, dy
+
+    def dist(self, ax, ay, bx, by):
+        dx, dy = self.wd(bx - ax, by - ay)
+        return math.hypot(dx, dy)
+
+    # ---------------- еда ----------------
+    def spawn_food(self):
+        PW, PH = self.f.PW, self.f.PH
+        m = self.CS * 2
+        pts = self.body_points()
+        for _ in range(400):
+            x = random.uniform(m, PW - m)
+            y = random.uniform(m, PH - m)
+            if self.dist(self.hx, self.hy, x, y) < self.CS * 5:
+                continue
+            ok = True
+            for p in pts:
+                if self.dist(p[0], p[1], x, y) < self.CS * 1.6:
+                    ok = False
+                    break
+            if ok:
+                self.fx, self.fy = x, y
+                return
+        self.fx, self.fy = PW * 0.5, PH * 0.5
+
+    def body_points(self):
+        tr = self.trail
+        n = len(tr)
+        pts = []
+        sp = max(0.7, self.T * 0.45)
+        target, acc = 0.0, 0.0
+        PW, PH = self.f.PW, self.f.PH
+        i = n - 1
+        while i > 0 and acc <= self.body_len:
+            ax, ay = tr[i]
+            dx, dy = self.wd(tr[i - 1][0] - ax, tr[i - 1][1] - ay)
+            seg = math.hypot(dx, dy)
+            if seg > 1e-6:
+                while acc + seg >= target and target <= self.body_len:
+                    t = (target - acc) / seg
+                    x, y = ax + dx * t, ay + dy * t
+                    if self.wrap:
+                        x %= PW
+                        y %= PH
+                    pts.append((x, y))
+                    target += sp
+            acc += seg
+            i -= 1
+        if not pts:
+            pts = [tr[-1]]
+        return pts
+
+    # ---------------- ввод ----------------
+    def steer(self, dx, dy):
+        # пункт 1: сравниваем с ПОСЛЕДНИМ направлением в очереди, а не с текущим
+        last = self.q[-1] if self.q else (self.dx, self.dy)
+        if (dx, dy) == (-last[0], -last[1]):
+            return
+        if (dx, dy) == last:
+            return
+        if len(self.q) < 3:
+            self.q.append((dx, dy))
+
+    def ai(self):
+        """автопилот для демо-режима."""
+        PW, PH = self.f.PW, self.f.PH
+        cs = self.CS
+        opts = [(0, -1), (0, 1), (-1, 0), (1, 0)]
+        best, bd = None, 1e9
+        pts = self.pts if getattr(self, 'pts', None) else self.body_points()
+        for d in opts:
+            if d == (-self.dx, -self.dy):
+                continue
+            nx, ny = self.hx + d[0] * cs * 1.6, self.hy + d[1] * cs * 1.6
+            if not self.wrap and (nx < cs or ny < cs or nx > PW - cs or ny > PH - cs):
+                continue
+            bad = False
+            for p in pts:
+                if self.dist(p[0], p[1], nx, ny) < self.T * 1.4:
+                    bad = True
+                    break
+            if bad:
+                continue
+            dd = self.dist(nx, ny, self.fx, self.fy) + random.uniform(0, cs)
+            if dd < bd:
+                bd, best = dd, d
+        if best:
+            self.steer(best[0], best[1])
+
+    # ---------------- логика ----------------
+    def step(self, dt, t):
+        f = self.f
+        if self.state == 'ready':
+            self.ai()
+        elif self.state == 'dead':
+            self.dead_t += dt
+            return
+        elif self.state != 'play':
+            return
+        # очередь поворотов
+        if self.q:
+            moved = (self.dist(self.turnpos[0], self.turnpos[1], self.hx, self.hy)
+                     if isinstance(self.turnpos, tuple) else 99.0)
+            if moved > self.CS * 0.7:
+                self.dx, self.dy = self.q.pop(0)
+                self.turnpos = (self.hx, self.hy)
+        self.hx += self.dx * self.speed * dt
+        self.hy += self.dy * self.speed * dt
+        PW, PH = f.PW, f.PH
+        if self.wrap:
+            self.hx %= PW
+            self.hy %= PH
+        else:
+            lim = self.T * 0.55
+            if self.hx < lim or self.hx > PW - lim or self.hy < lim or self.hy > PH - lim:
+                return self.die()
+        self.trail.append((self.hx, self.hy))
+        # обрезка следа
+        need = self.body_len + self.CS * 5
+        acc, i = 0.0, len(self.trail) - 1
+        while i > 0 and acc < need:
+            a, b = self.trail[i], self.trail[i - 1]
+            acc += self.dist(a[0], a[1], b[0], b[1])
+            i -= 1
+        if i > 0:
+            del self.trail[:i]
+        self.pts = self.body_points()
+        # самопересечение
+        T = self.T
+        start = int(T * 2.0 / max(0.7, T * 0.45)) + 1
+        r2 = (T * 0.92) ** 2
+        for k in range(start, len(self.pts)):
+            p = self.pts[k]
+            dx, dy = self.wd(p[0] - self.hx, p[1] - self.hy)
+            if dx * dx + dy * dy < r2:
+                return self.die()
+        # еда
+        if self.dist(self.hx, self.hy, self.fx, self.fy) < T + self.CS * 0.7:
+            self.eat()
+        self.eat_flash = max(0.0, self.eat_flash - dt * 3.0)
+
+    def eat(self):
+        demo = self.state == 'ready'
+        if not demo:
+            self.score += 10 + int(self.speed / self.spd0 * 4)
+            if self.score > self.best:
+                self.best = self.score
+                save_best(self.best)
+        self.body_len += self.CS * 1.7
+        self.speed = min(self.spd0 * 2.6, self.speed * 1.045)
+        self.eat_flash = 1.0
+        self.rings.append([self.fx, self.fy, 0.0, (255, 170, 60)])
+        for _ in range(16):
+            a = random.uniform(0, 6.283)
+            s = random.uniform(6, 26)
+            self.parts.append([self.fx, self.fy, math.cos(a) * s, math.sin(a) * s, random.uniform(0.35, 0.9),
+                               random.choice([(255, 210, 90), (255, 120, 60), (180, 255, 120), (255, 250, 220)])])
+        self.pops.append([self.fx, self.fy - 3, 0.9, '+10'])
+        if not demo:
+            vibrate(28)
+            sys.stdout.write(chr(7))
+            sys.stdout.flush()
+        self.spawn_food()
+
+    def die(self):
+        if self.state == 'ready':
+            self.reset()
+            return
+        self.state = 'dead'
+        self.dead_t = 0.0
+        self.rings.append([self.hx, self.hy, 0.0, (255, 70, 70)])
+        for _ in range(34):
+            a = random.uniform(0, 6.283)
+            s = random.uniform(4, 34)
+            self.parts.append([self.hx, self.hy, math.cos(a) * s, math.sin(a) * s, random.uniform(0.4, 1.3),
+                               random.choice([(255, 90, 90), (255, 160, 60), (120, 255, 120)])])
+        vibrate(160)
+        if self.score > self.best:
+            self.best = self.score
+            save_best(self.best)
+
+    # ---------------- отрисовка ----------------
+    def draw(self, t):
+        f, spr = self.f, self.spr
+        f.clear(self.bg)
+        pulse = 0.55 + 0.45 * math.sin(t * 3.4)
+        bob = math.sin(t * 2.2) * 0.9
+        f.add(self.fx, self.fy + bob, spr.glow(int(self.CS * 2.4)), (255, 150, 40), 0.20 + 0.10 * pulse)
+        f.add(self.hx, self.hy, spr.glow(int(self.CS * 1.7)), (120, 255, 150), 0.10 + 0.05 * pulse)
+        # частицы
+        for p in self.parts:
+            a = min(1.0, p[4] * 1.6)
+            f.dot(p[0], p[1], p[5], a)
+            if a > 0.55:
+                f.dot(p[0] + 1, p[1], p[5], a * 0.6)
+        # ударные волны
+        for r in self.rings:
+            f.add(r[0], r[1], spr.ring(int(2 + r[2] * self.CS * 3)), r[3], max(0.0, 0.55 - r[2] * 0.5))
+        # яблоко
+        f.blend(self.fx, self.fy + bob, self.apple, 1.0)
+        # тело
+        pts = self.pts if getattr(self, 'pts', None) else self.body_points()
+        n = len(pts)
+        PW = f.PW
+        for k in range(n - 1, -1, -1):
+            u = k / max(1, n - 1)
+            x, y = pts[k]
+            r = self.T * (1.02 - 0.62 * u) + 0.4
+            band = 0.82 + 0.20 * math.sin(k * 1.55)
+            shade = (1.0 - 0.55 * u) * band
+            rgb = ((int(126 * shade + 40 * u) // 12) * 12,
+                   (int(216 * shade + 10 * u) // 12) * 12,
+                   (int(78 * shade + 60 * u) // 12) * 12)
+            sph = spr.sphere(r, rgb, 0.5, 0.24)
+            f.blend(x, y, sph, 1.0)
+            if self.wrap and r > 1:                  # «призрак» у шва тора
+                if x < r:
+                    f.blend(x + PW, y, sph, 1.0)
+                elif x > PW - r:
+                    f.blend(x - PW, y, sph, 1.0)
+            if k % 3 == 0 and u < 0.92:
+                f.blend(x - r * 0.28, y - r * 0.34, spr.sphere(max(1, r * 0.34), (232, 255, 208), 0.9, 0.55), 0.55)
+        # голова
+        dx, dy = self.dx, self.dy
+        if len(self.trail) > 2:
+            a, b = self.trail[-1], self.trail[-3]
+            ddx, ddy = self.wd(a[0] - b[0], a[1] - b[1])
+            l = math.hypot(ddx, ddy) or 1.0
+            dx, dy = ddx / l, ddy / l
+        hr = self.T * 1.28
+        f.blend(self.hx, self.hy, spr.sphere(hr, (152, 236, 116), 0.55, 0.26))
+        f.blend(self.hx + dx * hr * 0.35, self.hy + dy * hr * 0.35, spr.sphere(hr * 0.8, (176, 248, 140), 0.5, 0.30))
+        # язык
+        if int(t * 2.2) % 3 == 0:
+            ext = (0.35 + 0.65 * abs(math.sin(t * 12.0))) * self.CS * 1.5
+            tx, ty = self.hx + dx * (hr + ext), self.hy + dy * (hr + ext)
+            for i in range(int(ext)):
+                f.dot(self.hx + dx * (hr + i), self.hy + dy * (hr + i), (255, 90, 130), 1.0)
+            f.dot(tx, ty, (255, 90, 130), 1.0)
+            f.dot(tx + dy, ty + dx, (255, 90, 130), 0.9)
+            f.dot(tx - dy, ty - dx, (255, 90, 130), 0.9)
+        # глаза
+        ex, ey = -dy, dx
+        for s in (-1, 1):
+            cxp = self.hx + dx * hr * 0.42 + ex * s * hr * 0.62
+            cyp = self.hy + dy * hr * 0.42 + ey * s * hr * 0.62
+            f.blend(cxp, cyp, spr.sphere(max(1, hr * 0.36), (250, 252, 244), 0.7, 0.55))
+            f.blend(cxp + dx * 0.5, cyp + dy * 0.5, spr.sphere(max(1, hr * 0.19), (24, 34, 22), 0.0, 0.1))
+            f.dot(cxp - hr * 0.12, cyp - hr * 0.14, (255, 255, 255), 0.9)
+        # вспышка при поедании
+        if self.eat_flash > 0.02:
+            f.add(self.hx, self.hy, spr.glow(int(self.CS * 5)), (255, 220, 130), self.eat_flash * 0.45)
+
+
+def load_best():
+    try:
+        with open(SCOREFILE) as fh:
+            return int(json.load(fh).get('best', 0))
+    except Exception:
+        return 0
+
+
+def save_best(v):
+    try:
+        with open(SCOREFILE, 'w') as fh:
+            json.dump({'best': int(v)}, fh)
+    except Exception:
+        pass
+
+
+# ============================ 5. ЗАПУСК В ТЕРМИНАЛЕ ============================
+def run_cli(argv):
+    wrap = '--wrap' in argv
+    use_np = probe('py', 'numpy')
+    try:
+        sz = os.get_terminal_size(sys.stdout.fileno())
+    except Exception:
+        sz = shutil.get_terminal_size((80, 26))
+    cols, rows = max(40, sz.columns), max(14, sz.lines)
+    rows -= 2
+    tc = ('truecolor' in os.environ.get('COLORTERM', '').lower()
+          or '24bit' in os.environ.get('COLORTERM', '')
+          or 'truecolor' in os.environ.get('TERM', '').lower()
+          or IS_TERMUX)
+    old = None
+    try:
+        old = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        old = None
+    if old is not None:
+        atexit.register(lambda: (termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old),
+                                 sys.stdout.write(ESC + '[?25h' + ESC + '[0m' + ESC + '[?1049l'),
+                                 sys.stdout.flush()))
+
+    def onwinch(*a):
+        pass
+    try:
+        signal.signal(signal.SIGWINCH, onwinch)
+    except Exception:
+        pass
+
+    tty_mode = False
+    try:
+        import tty
+        tty.setcbreak(sys.stdin.fileno())
+        tty_mode = True
+    except Exception:
+        tty_mode = False
+
+    sys.stdout.write(ESC + '[?1049h' + ESC + '[?25l' + ESC + '[2J')
+    sys.stdout.flush()
+
+    spr = Sprites()
+    f = Field(cols, rows, spr)
+    bg = make_bg(f.PW, f.PH, wrap, use_np)
+    g = Game(f, spr, bg, wrap)
+    g.pts = g.body_points()
+    keymap = {119: (0, -1), 107: (0, -1), 115: (0, 1), 106: (0, 1),
+              97: (-1, 0), 104: (-1, 0), 100: (1, 0), 108: (1, 0)}
+    arrows = {65: (0, -1), 66: (0, 1), 67: (1, 0), 68: (-1, 0)}
+    FPS = 22.0
+    prev = time.time()
+    acc = 0.0
+    t0 = time.time()
+    try:
+        while True:
+            now = time.time()
+            dt = min(0.06, now - prev)
+            prev = now
+            acc += dt
+            # ввод
+            if tty_mode:
+                while True:
+                    r, _, _ = select.select([sys.stdin], [], [], 0)
+                    if not r:
+                        break
+                    try:
+                        data = os.read(sys.stdin.fileno(), 64)
+                    except Exception:
+                        data = b''
+                    if not data:
+                        break
+                    i = 0
+                    while i < len(data):
+                        c = data[i]
+                        if c == 27 and i + 2 < len(data) and data[i + 1] in (91, 79):
+                            d = arrows.get(data[i + 2])
+                            if d:
+                                g.steer(*d)
+                            i += 3
+                            continue
+                        if c == 27:
+                            i += 1
+                            continue
+                        ch = chr(c).lower()
+                        if ch in keymap:
+                            g.steer(*keymap[ch])
+                        elif ch == ' ':
+                            if g.state in ('play', 'pause'):
+                                g.state = 'pause' if g.state == 'play' else 'play'
+                            else:
+                                g.score = 0
+                                g.reset()
+                                g.state = 'play'
+                        elif ch == 'r':
+                            g.score = 0
+                            g.reset()
+                            g.state = 'play'
+                        elif ch in ('q', 'x', chr(3)):
+                            raise KeyboardInterrupt
+                        elif ch in ('+', '='):
+                            g.speed = min(g.spd0 * 3, g.speed * 1.12)
+                        elif ch == '-':
+                            g.speed = max(g.spd0 * 0.5, g.speed / 1.12)
+                        i += 1
+            # физика (2 подшага для точности на низкой частоте кадров)
+            sub = 2
+            for _ in range(sub):
+                g.step(dt / sub, now - t0)
+            # частицы
+            for p in g.parts:
+                p[0] += p[2] * dt
+                p[1] += p[3] * dt
+                p[2] *= 0.90
+                p[3] = p[3] * 0.90 + 12 * dt
+                p[4] -= dt * 0.9
+            g.parts = [p for p in g.parts if p[4] > 0]
+            for r in g.rings:
+                r[2] += dt * 1.8
+            g.rings = [r for r in g.rings if r[2] < 1.1]
+            for p in g.pops:
+                p[1] -= dt * 8
+                p[2] -= dt * 0.9
+            g.pops = [p for p in g.pops if p[2] > 0]
+            # кадр
+            if acc >= 1.0 / FPS:
+                acc = 0.0
+                g.draw(now - t0)
+                f.present(tc)
+                hud(f, g)
+                sys.stdout.flush()
+            time.sleep(0.001)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        sys.stdout.write(ESC + '[?25h' + ESC + '[0m' + ESC + '[?1049l')
+        sys.stdout.flush()
+    print('HYPER SNAKE · очков: %d · рекорд: %d' % (g.score, g.best))
+    return 0
+
+
+def hud(f, g):
+    out = []
+    if g.state == 'ready':
+        txt = ' НАЖМИТЕ ПРОБЕЛ '
+    elif g.state == 'pause':
+        txt = ' ПАУЗА · ПРОБЕЛ '
+    elif g.state == 'dead':
+        txt = ' КОНЕЦ · R ЗАНОВО '
+    else:
+        txt = ''
+    line1 = (ESC + '[1;97m HYPER SNAKE ' + ESC + '[0m' +
+             ESC + '[38;2;120;255;160m  SCORE %6d ' % g.score + ESC + '[0m' +
+             ESC + '[38;2;255;220;120m BEST %6d ' % g.best + ESC + '[0m' +
+             ESC + '[38;2;140;200;255m LEN %3d ' % int(g.body_len / g.CS) + ESC + '[0m' +
+             ESC + '[38;2;255;150;200m SPD x%.2f ' % (g.speed / g.spd0) + ESC + '[0m')
+    if txt:
+        line1 += ESC + '[1;44;97m' + txt + ESC + '[0m'
+    out.append(ESC + '[%d;1H' % (f.ROWS + 1) + ESC + '[K' + line1)
+    out.append(ESC + '[%d;1H' % (f.ROWS + 2) + ESC + '[K' +
+               ESC + '[90m стрелки/WASD · SPACE пауза · R заново · Q выход · +/- скорость · ' +
+               ('стены проходимы' if g.wrap else 'стены смертельны') + ESC + '[0m')
+    sys.stdout.write(''.join(out))
+
+
+# ============================ 6. WEB-РЕЖИМ ============================
+HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#04120c">
+<title>HYPER SNAKE · Termux Edition</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { background:#04100a; overflow:hidden; font-size:0; line-height:0; }
+  body { font-family:'Segoe UI', Roboto, system-ui, sans-serif; }
+  #app { position:fixed; left:0; top:0; width:100%; height:100%; overflow:hidden;
+         font-size:15px; line-height:1.35; color:#dff5e2; touch-action:none; }
+  #cv { position:absolute; left:0; top:0; display:block; touch-action:none; }
+
+  /* --- HUD: БЕЗ backdrop-filter (он жрёт fps на слабых SoC) --- */
+  #hud { position:absolute; left:0; top:0; right:0; padding:10px 12px; display:flex;
+         gap:7px; flex-wrap:wrap; align-items:center; pointer-events:none; z-index:5; }
+  .chip { display:inline-flex; align-items:center; gap:7px; padding:6px 12px;
+          border-radius:13px; background:rgba(6,22,15,.82);
+          border:1px solid rgba(140,255,180,.20);
+          box-shadow:0 5px 18px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.07);
+          font-size:12px; letter-spacing:.06em; text-transform:uppercase; font-weight:700; }
+  .chip small { display:block; font-size:9px; opacity:.55; letter-spacing:.14em; font-weight:600; }
+  .chip b { font-size:19px; font-variant-numeric:tabular-nums; line-height:1.1; }
+  .c-score b { color:#a6ff8f; text-shadow:0 0 14px rgba(120,255,140,.5); }
+  .c-best  b { color:#ffd166; }
+  .c-len   b { color:#8fd3ff; }
+  .c-spd   b { color:#ff9ecb; }
+  .c-fps   { pointer-events:auto; cursor:pointer; opacity:.85; }
+  .c-fps b { color:#c9ffd8; font-size:16px; }
+  .c-fps:hover { opacity:1; border-color:rgba(160,255,200,.45); }
+  .brand { margin-left:auto; font-weight:900; font-size:12px; letter-spacing:.26em;
+           color:#7fe0a4; text-shadow:0 0 18px rgba(80,255,150,.35); }
+  .pop { animation:pop .32s ease-out; }
+  @keyframes pop { 0%{transform:scale(1)} 40%{transform:scale(1.2)} 100%{transform:scale(1)} }
+
+  /* --- оверлеи --- */
+  #ov { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+        z-index:9; background:radial-gradient(circle at 50% 45%, rgba(4,20,13,.72), rgba(2,8,6,.96));
+        transition:opacity .3s ease; }
+  #ov.hidden { opacity:0; pointer-events:none; }
+  .card { text-align:center; padding:32px 28px; max-width:min(92vw,470px);
+          border-radius:24px; background:linear-gradient(160deg, rgba(16,44,30,.94), rgba(6,20,14,.97));
+          border:1px solid rgba(150,255,190,.22);
+          box-shadow:0 30px 90px rgba(0,0,0,.75), inset 0 1px 0 rgba(255,255,255,.08); }
+  .ttl { font-size:clamp(34px,10vw,62px); font-weight:900; letter-spacing:.06em; line-height:.95;
+         color:#b6ff96; text-shadow:0 4px 0 #1d6b45, 0 10px 34px rgba(70,255,130,.45); }
+  .sub { margin-top:8px; font-size:11px; letter-spacing:.42em; color:#8fd8ac; opacity:.85; }
+  .big { margin-top:14px; font-size:54px; font-weight:900; color:#a6ff8f; line-height:1;
+         text-shadow:0 0 30px rgba(120,255,140,.45); font-variant-numeric:tabular-nums; }
+  .lbl { font-size:11px; letter-spacing:.3em; color:#9fd6b3; opacity:.7; }
+  .keys { margin-top:16px; display:flex; gap:6px; justify-content:center; flex-wrap:wrap; }
+  kbd { font-family:inherit; font-size:11px; padding:5px 9px; border-radius:8px;
+        background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
+        border-bottom-width:2px; color:#e7ffe9; }
+  .btn { margin-top:20px; display:inline-block; cursor:pointer; border:0; padding:14px 32px;
+         border-radius:999px; font-size:15px; font-weight:800; letter-spacing:.14em; color:#062015;
+         background:linear-gradient(180deg,#c8ff9e,#4ee08a);
+         box-shadow:0 12px 34px rgba(60,230,130,.35), inset 0 1px 0 rgba(255,255,255,.6);
+         transition:transform .12s ease, box-shadow .12s ease; }
+  .btn:hover { transform:translateY(-1px); box-shadow:0 16px 40px rgba(60,230,130,.45), inset 0 1px 0 rgba(255,255,255,.6); }
+  .btn:active { transform:translateY(2px) scale(.98); }
+  .btn.ghost { background:rgba(255,255,255,.07); color:#cdf7d8; border:1px solid rgba(160,255,200,.28);
+               box-shadow:none; font-size:12px; padding:11px 20px; letter-spacing:.1em; }
+  .btn.ghost:hover { background:rgba(140,255,190,.16); }
+  .note { margin-top:13px; font-size:11px; color:#88c6a0; opacity:.8; line-height:1.7; }
+
+  /* --- тач-панель: только на десктопе --- */
+  #pad { position:absolute; right:14px; bottom:16px; z-index:6; display:none;
+         grid-template-columns:repeat(3,52px); grid-template-rows:repeat(3,52px); gap:7px; }
+  #pad.on { display:grid; }
+  .pb { border-radius:14px; border:1px solid rgba(160,255,190,.24); cursor:pointer;
+        background:rgba(8,28,18,.78); color:#bff5cd; font-size:19px; font-weight:800;
+        display:flex; align-items:center; justify-content:center; user-select:none;
+        box-shadow:0 6px 18px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06);
+        transition:background .1s ease, transform .1s ease; }
+  .pb:hover { background:rgba(60,160,100,.4); }
+  .pb:active { background:rgba(90,255,150,.4); transform:scale(.94); }
+  .pb.u{grid-area:1/2} .pb.l{grid-area:2/1} .pb.r{grid-area:2/3} .pb.d{grid-area:3/2} .pb.p{grid-area:3/1}
+  .hint { position:absolute; left:14px; bottom:16px; z-index:6; font-size:11px; color:#7fbf9a;
+          letter-spacing:.08em; opacity:.8; pointer-events:none; max-width:60vw; line-height:1.6; }
+  #toast { position:absolute; left:50%; bottom:16%; transform:translate(-50%,10px); z-index:8;
+           padding:10px 20px; border-radius:999px; background:rgba(8,30,19,.94);
+           border:1px solid rgba(150,255,190,.3); color:#e2ffe9; font-size:12px;
+           letter-spacing:.06em; opacity:0; pointer-events:none;
+           transition:opacity .22s ease, transform .22s ease; }
+  #toast.on { opacity:1; transform:translate(-50%,0); }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="cv"></canvas>
+  <div id="hud">
+    <div class="chip c-score"><small>Очки</small><b id="sc">0</b></div>
+    <div class="chip c-best"><small>Рекорд</small><b id="bs">0</b></div>
+    <div class="chip c-len"><small>Длина</small><b id="ln">6</b></div>
+    <div class="chip c-spd"><small>Скорость</small><b id="sp">1.0x</b></div>
+    <div class="chip c-fps" id="qchip" title="качество рендера"><small id="ql">FPS · АВТО</small><b id="fp">60</b></div>
+    <div class="brand">HYPER SNAKE</div>
+  </div>
+  <div id="pad">
+    <div class="pb u" data-d="0,-1" title="вверх">&#9650;</div>
+    <div class="pb l" data-d="-1,0" title="влево">&#9664;</div>
+    <div class="pb r" data-d="1,0" title="вправо">&#9654;</div>
+    <div class="pb d" data-d="0,1" title="вниз">&#9660;</div>
+    <div class="pb p" data-d="p" title="пауза">&#10073;&#10073;</div>
+  </div>
+  <div class="hint" id="hint"></div>
+  <div id="toast"></div>
+  <div id="ov"><div class="card" id="card"></div></div>
+</div>
+<script>
+(function(){
+'use strict';
+var cv = document.getElementById('cv');
+var ctx = cv.getContext('2d', { alpha:false });          // непрозрачный canvas = быстрее композитинг
+var elSc = document.getElementById('sc'), elBs = document.getElementById('bs'),
+    elLn = document.getElementById('ln'), elSp = document.getElementById('sp'),
+    elFp = document.getElementById('fp'), elQl = document.getElementById('ql'),
+    qchip = document.getElementById('qchip'),
+    ov = document.getElementById('ov'), card = document.getElementById('card'),
+    pad = document.getElementById('pad'), hintEl = document.getElementById('hint'),
+    toastEl = document.getElementById('toast');
+
+/* ---------- платформа: телефон или десктоп ---------- */
+var IS_TOUCH  = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 0;
+var IS_MOBILE = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(navigator.userAgent)
+                || (IS_TOUCH && !window.matchMedia);
+/* точный указатель = мышь/тачпад -> это десктоп. На телефоне кнопок нет (мешают, есть свайп),
+   на десктопе оставляем: мышь сама по себе змейкой не управляет. */
+var FINE_POINTER = window.matchMedia ? window.matchMedia('(pointer:fine)').matches : !IS_TOUCH;
+var SHOW_PAD = FINE_POINTER || !IS_TOUCH;
+if(SHOW_PAD) pad.classList.add('on');
+hintEl.innerHTML = SHOW_PAD
+  ? 'стрелки / WASD &middot; клик мышью — поворот &middot; SPACE пауза &middot; R заново &middot; F — качество'
+  : 'свайп по экрану в любую сторону &middot; тап — старт';
+
+var TAU = 6.283185307;
+var W = 0, H = 0, DPR = 1, BASE_DPR = 1, RS = 1;
+var bg = null, borderPath = null, LIM = 2;
+
+/* ---------- состояние ---------- */
+var G = {
+  state:'ready', score:0, best:0, wrap:false, t:0,
+  hx:0, hy:0, dx:1, dy:0, q:[], turnAt:null,
+  trailX:[], trailY:[],
+  ptsX:new Float32Array(4096), ptsY:new Float32Array(4096), ptN:0,
+  bodyLen:0, T:20, CS:30, speed:0, spd0:0, fx:0, fy:0,
+  parts:[], rings:[], pops:[], flash:0, shake:0, deadT:0,
+  danger:0, hitEdge:-1, hitT:0, hitGrad:null
+};
+try { G.best = parseInt(localStorage.getItem('hyperSnakeBest')||'0',10)||0; } catch(e){}
+
+/* ---------- звук ---------- */
+var AC = null;
+function beep(f, d, type, vol){
+  try{
+    AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+    var o = AC.createOscillator(), g = AC.createGain();
+    o.type = type||'sine'; o.frequency.value = f;
+    g.gain.value = 0; o.connect(g); g.connect(AC.destination);
+    var t = AC.currentTime;
+    g.gain.linearRampToValueAtTime(vol||0.13, t+0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t+(d||0.16));
+    o.start(t); o.stop(t+(d||0.16)+0.02);
+  }catch(e){}
+}
+var toastTm = 0;
+function toast(msg){
+  toastEl.textContent = msg;
+  toastEl.classList.add('on');
+  clearTimeout(toastTm);
+  toastTm = setTimeout(function(){ toastEl.classList.remove('on'); }, 1400);
+}
+
+/* ---------- кэш спрайтов (вместо градиентов каждый кадр) ---------- */
+var glowC = {}, appleC = null, appleS = 0, appleKey = '', headC = null, headS = 0, headKey = '';
+
+function glowSprite(r, rgb){
+  r = Math.max(2, Math.round(r));
+  var key = r + '|' + rgb + '|' + DPR;
+  var s = glowC[key];
+  if(s) return s;
+  var size = r*2 + 2, px = Math.max(2, Math.ceil(size*DPR));
+  var c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  var g = c.getContext('2d');
+  var cx = px/2;
+  var grd = g.createRadialGradient(cx, cx, 1, cx, cx, cx-1);
+  grd.addColorStop(0, 'rgba('+rgb+',1)');
+  grd.addColorStop(1, 'rgba('+rgb+',0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, px, px);
+  s = { cv:c, size:size, half:size/2 };
+  glowC[key] = s;
+  return s;
+}
+function light(x, y, r, rgb, a){
+  if(a <= 0.004) return;
+  var s = glowSprite(r, rgb);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = a > 1 ? 1 : a;
+  ctx.drawImage(s.cv, x - s.half, y - s.half, s.size, s.size);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* ---------- размеры / качество ---------- */
+var avgMs = 16, qCool = 0, qMode = 'auto', fpsShow = 60, fpsAcc = 0, fpsN = 0;
+function applyCanvas(){
+  DPR = BASE_DPR * RS;
+  cv.width  = Math.max(2, Math.round(W*DPR));
+  cv.height = Math.max(2, Math.round(H*DPR));
+  cv.style.width = W+'px'; cv.style.height = H+'px';
+  glowC = {}; appleKey = ''; headKey = '';      // кэши зависят от DPR
+  buildBg();
+}
+function adapt(ms){
+  avgMs += (ms - avgMs) * 0.07;
+  if(qMode !== 'auto'){ return; }
+  if(qCool > 0){ qCool -= ms; return; }
+  if(avgMs > 21 && RS > 0.72){ RS = Math.max(0.72, RS - 0.14); applyCanvas(); qCool = 1400; }
+  else if(avgMs < 13.4 && RS < 1){ RS = Math.min(1, RS + 0.07); applyCanvas(); qCool = 1800; }
+}
+qchip.addEventListener('click', function(){
+  qMode = (qMode === 'auto') ? 'full' : 'auto';
+  if(qMode === 'full' && RS < 1){ RS = 1; applyCanvas(); }
+  elQl.textContent = 'FPS · ' + (qMode === 'auto' ? 'АВТО' : 'МАКС');
+  toast(qMode === 'auto' ? 'Качество: АВТО (подстраивается под fps)' : 'Качество: МАКСИМУМ (фиксированное)');
+});
+
+var lastW = 0, lastH = 0;
+function resize(){
+  var nw = window.innerWidth, nh = window.innerHeight;
+  var changed = (Math.abs(nw-lastW) > 2 || Math.abs(nh-lastH) > 2);
+  var big = (Math.abs(nw-lastW) > 30 || Math.abs(nh-lastH) > 90);
+  lastW = nw; lastH = nh;
+  if(!changed && bg) return;
+  var ow = W, oh = H;
+  W = nw; H = nh;
+  BASE_DPR = Math.min(2, window.devicePixelRatio || 1);
+  borderPath = new Path2D();
+  borderPath.rect(1.5, 1.5, Math.max(1, W-3), Math.max(1, H-3));
+  if(G.CS && big){
+    rescale(ow > 0 ? W/ow : 1, oh > 0 ? H/oh : 1);   // поворот экрана НЕ сбрасывает игру
+  }
+  applyCanvas();
+  if(!G.CS) reset(true);
+}
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', function(){ setTimeout(resize, 120); });
+
+function rescale(sx, sy){
+  if(!isFinite(sx) || !isFinite(sy)) return;
+  var i;
+  for(i=0;i<G.trailX.length;i++){ G.trailX[i] *= sx; G.trailY[i] *= sy; }
+  G.hx *= sx; G.hy *= sy; G.fx *= sx; G.fy *= sy;
+  if(G.turnAt){ G.turnAt[0] *= sx; G.turnAt[1] *= sy; }
+  for(i=0;i<G.parts.length;i++){ G.parts[i].x *= sx; G.parts[i].y *= sy; }
+  for(i=0;i<G.rings.length;i++){ G.rings[i].x *= sx; G.rings[i].y *= sy; }
+  for(i=0;i<G.pops.length;i++){ G.pops[i].x *= sx; G.pops[i].y *= sy; }
+  G.hitGrad = null;
+}
+
+/* ---------- фон (рисуется один раз, виньетка запечена внутрь) ---------- */
+function buildBg(){
+  bg = document.createElement('canvas');
+  bg.width = cv.width; bg.height = cv.height;
+  var c = bg.getContext('2d');
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  var g = c.createRadialGradient(W*0.5, H*0.42, 40, W*0.5, H*0.5, Math.max(W,H)*0.78);
+  g.addColorStop(0,'#123a24'); g.addColorStop(0.5,'#0a2418'); g.addColorStop(1,'#03110b');
+  c.fillStyle = g; c.fillRect(0,0,W,H);
+
+  // трава
+  var n = Math.round(W*H/2600), i;
+  c.lineCap = 'round';
+  for(i=0;i<n;i++){
+    var x = Math.random()*W, y = Math.random()*H, l = 6+Math.random()*22, a = -0.9+Math.random()*0.5;
+    var k = 0.10+Math.random()*0.30;
+    c.strokeStyle = 'rgba('+Math.round(70+120*k)+','+Math.round(150+90*k)+','+Math.round(70+70*k)+','+(0.07+0.20*k).toFixed(3)+')';
+    c.lineWidth = 1+Math.random()*1.6;
+    c.beginPath(); c.moveTo(x,y);
+    c.quadraticCurveTo(x+Math.sin(a)*l*0.5, y-l*0.6, x+Math.sin(a)*l, y-l);
+    c.stroke();
+  }
+  // камни
+  for(i=0;i<Math.round(W*H/90000)+5;i++){
+    var rx = Math.random()*W, ry = Math.random()*H, rr = 6+Math.random()*20;
+    var sg = c.createRadialGradient(rx-rr*0.4, ry-rr*0.45, rr*0.1, rx, ry, rr);
+    sg.addColorStop(0,'#6d7a70'); sg.addColorStop(0.6,'#3d4a42'); sg.addColorStop(1,'#1a231e');
+    c.fillStyle = sg; c.beginPath();
+    c.ellipse(rx, ry, rr, rr*(0.55+Math.random()*0.3), Math.random()*3, 0, TAU); c.fill();
+    c.fillStyle = 'rgba(60,120,70,0.22)';
+    c.beginPath(); c.ellipse(rx-rr*0.15, ry-rr*0.55, rr*0.7, rr*0.22, 0.3, 0, TAU); c.fill();
+  }
+  // виньетка запечена в фон: минус один полноэкранный слой композитинга
+  var vg = c.createRadialGradient(W*0.5, H*0.5, Math.min(W,H)*0.30, W*0.5, H*0.5, Math.max(W,H)*0.78);
+  vg.addColorStop(0,'rgba(0,0,0,0)'); vg.addColorStop(1,'rgba(0,0,0,0.55)');
+  c.fillStyle = vg; c.fillRect(0,0,W,H);
+
+  // граница — ВПЛОТНУЮ к краю экрана (край экрана = стена)
+  c.strokeStyle = 'rgba(0,0,0,0.62)'; c.lineWidth = 16;
+  c.strokeRect(0, 0, W, H);                              // видимая половина: 8 px фаски
+  var fg = c.createLinearGradient(0,0,W,H);
+  fg.addColorStop(0,'rgba(150,255,190,0.42)');
+  fg.addColorStop(0.5,'rgba(90,210,150,0.16)');
+  fg.addColorStop(1,'rgba(255,220,140,0.34)');
+  c.strokeStyle = fg; c.lineWidth = 2;
+  c.strokeRect(7, 7, Math.max(1,W-14), Math.max(1,H-14));
+  c.strokeStyle = 'rgba(0,0,0,0.45)'; c.lineWidth = 1;
+  c.strokeRect(9.5, 9.5, Math.max(1,W-19), Math.max(1,H-19));
+  // угловые скобы
+  var L = Math.min(46, Math.min(W,H)*0.09);
+  c.strokeStyle = 'rgba(190,255,210,0.55)'; c.lineWidth = 3; c.lineCap = 'round';
+  var corners = [[10,10,1,1],[W-10,10,-1,1],[10,H-10,1,-1],[W-10,H-10,-1,-1]];
+  for(i=0;i<4;i++){
+    var cx0 = corners[i][0], cy0 = corners[i][1], sx = corners[i][2], sy = corners[i][3];
+    c.beginPath();
+    c.moveTo(cx0 + sx*L, cy0); c.lineTo(cx0, cy0); c.lineTo(cx0, cy0 + sy*L);
+    c.stroke();
+  }
+}
+
+/* ---------- гео-хелперы (пункт 3: честный тор) ---------- */
+function wdx(d){ if(!G.wrap) return d; if(d > W*0.5) return d-W; if(d < -W*0.5) return d+W; return d; }
+function wdy(d){ if(!G.wrap) return d; if(d > H*0.5) return d-H; if(d < -H*0.5) return d+H; return d; }
+function dist2(ax, ay, bx, by){ var dx = wdx(bx-ax), dy = wdy(by-ay); return dx*dx + dy*dy; }
+function dist(ax, ay, bx, by){ return Math.sqrt(dist2(ax, ay, bx, by)); }
+
+/* ---------- логика ---------- */
+function reset(hard){
+  G.CS = Math.max(22, Math.round(Math.min(W,H)/19));
+  G.T = G.CS*0.44;
+  G.spd0 = G.CS*5.4;
+  G.speed = G.spd0;
+  G.bodyLen = G.CS*6;
+  var hx = (W-G.CS*2)*0.35+G.CS, hy = H*0.5;
+  G.trailX.length = 0; G.trailY.length = 0;
+  for(var i=90;i>=0;i--){ G.trailX.push(hx-i*0.7); G.trailY.push(hy); }
+  G.hx = hx; G.hy = hy; G.dx = 1; G.dy = 0; G.q.length = 0; G.turnAt = null;
+  G.parts.length = 0; G.rings.length = 0; G.pops.length = 0;
+  G.flash = 0; G.shake = 0; G.deadT = 0; G.danger = 0; G.hitEdge = -1; G.hitT = 0; G.hitGrad = null;
+  if(hard !== false){ G.score = 0; }
+  spawnFood();
+  bodyPoints();
+}
+
+/* тело считаем ОДИН раз за кадр, в типизированные массивы, без мусора */
+function bodyPoints(){
+  var trX = G.trailX, trY = G.trailY, n = trX.length;
+  var px = G.ptsX, py = G.ptsY, cap = px.length;
+  var sp = Math.max(1.5, G.T*0.4), target = 0, acc = 0, m = 0, wrap = G.wrap;
+  for(var i=n-1; i>0 && acc<=G.bodyLen && m<cap; i--){
+    var ax = trX[i], ay = trY[i];
+    var ddx = wdx(trX[i-1]-ax), ddy = wdy(trY[i-1]-ay);
+    var seg = Math.sqrt(ddx*ddx + ddy*ddy);
+    if(seg > 1e-6){
+      while(acc+seg >= target && target <= G.bodyLen && m < cap){
+        var t = (target-acc)/seg;
+        var x = ax + ddx*t, y = ay + ddy*t;
+        if(wrap){ x = x - Math.floor(x/W)*W; y = y - Math.floor(y/H)*H; }
+        px[m] = x; py[m] = y; m++;
+        target += sp;
+      }
+    }
+    acc += seg;
+  }
+  if(m === 0){ px[0] = G.hx; py[0] = G.hy; m = 1; }
+  G.ptN = m;
+}
+
+function spawnFood(){
+  var m = G.CS*2.2, need = G.CS*1.5;
+  need *= need;
+  var far = G.CS*4;
+  for(var k=0;k<240;k++){
+    var x = m + Math.random()*(W-2*m), y = m + Math.random()*(H-2*m);
+    if(dist2(G.hx, G.hy, x, y) < far*far) continue;
+    var ok = true;
+    for(var i=0;i<G.ptN;i++){
+      if(dist2(G.ptsX[i], G.ptsY[i], x, y) < need){ ok = false; break; }
+    }
+    if(ok){ G.fx = x; G.fy = y; return; }
+  }
+  G.fx = W*0.7; G.fy = H*0.4;
+}
+
+/* пункт 1: разворот проверяем относительно ПОСЛЕДНЕГО направления в очереди */
+function steer(dx, dy){
+  if(G.state === 'pause' || G.state === 'dead') return;
+  var lx = G.dx, ly = G.dy;
+  if(G.q.length){ lx = G.q[G.q.length-1][0]; ly = G.q[G.q.length-1][1]; }
+  if(dx === -lx && dy === -ly) return;
+  if(dx === lx && dy === ly) return;
+  if(G.q.length < 3) G.q.push([dx, dy]);
+}
+
+function ai(){
+  var opts = AI_OPTS, best = null, bd = 1e18;
+  for(var i=0;i<4;i++){
+    var d = opts[i];
+    if(d[0] === -G.dx && d[1] === -G.dy) continue;
+    var nx = G.hx + d[0]*G.CS*1.8, ny = G.hy + d[1]*G.CS*1.8;
+    if(!G.wrap && (nx < G.CS || ny < G.CS || nx > W-G.CS || ny > H-G.CS)) continue;
+    var bad = false, rr = G.T*1.5; rr *= rr;
+    for(var j=2;j<G.ptN;j++){
+      if(dist2(G.ptsX[j], G.ptsY[j], nx, ny) < rr){ bad = true; break; }
+    }
+    if(bad) continue;
+    var dd = dist(nx, ny, G.fx, G.fy) + Math.random()*G.CS;
+    if(dd < bd){ bd = dd; best = d; }
+  }
+  if(best) steer(best[0], best[1]);
+}
+var AI_OPTS = [[0,-1],[0,1],[-1,0],[1,0]];
+
+/* движение — лёгкое, без пересчёта тела */
+function move(dt){
+  if(G.state !== 'play' && G.state !== 'ready') return;
+  if(G.q.length){
+    var moved = G.turnAt ? dist(G.turnAt[0], G.turnAt[1], G.hx, G.hy) : 1e9;
+    if(moved > G.CS*0.7){ var d = G.q.shift(); G.dx = d[0]; G.dy = d[1]; G.turnAt = [G.hx, G.hy]; }
+  }
+  G.hx += G.dx*G.speed*dt;
+  G.hy += G.dy*G.speed*dt;
+  if(G.wrap){
+    if(G.hx < 0) G.hx += W; else if(G.hx >= W) G.hx -= W;
+    if(G.hy < 0) G.hy += H; else if(G.hy >= H) G.hy -= H;
+  } else if(G.hx < LIM || G.hx > W-LIM || G.hy < LIM || G.hy > H-LIM){
+    hitWall(); die(); return;
+  }
+  G.trailX.push(G.hx); G.trailY.push(G.hy);
+  var need = G.bodyLen + G.CS*5, acc = 0, i = G.trailX.length-1;
+  while(i > 0 && acc < need){ acc += dist(G.trailX[i], G.trailY[i], G.trailX[i-1], G.trailY[i-1]); i--; }
+  if(i > 0){ G.trailX.splice(0, i); G.trailY.splice(0, i); }
+}
+function hitWall(){
+  var d = [G.hx, G.hy, W-G.hx, H-G.hy], m = 0;
+  for(var i=1;i<4;i++) if(d[i] < d[m]) m = i;
+  G.hitEdge = m; G.hitT = 1;
+  G.hitGrad = null;
+}
+/* проверки — один раз за кадр */
+function checks(dt){
+  if(G.state !== 'play' && G.state !== 'ready') return;
+  var neck = Math.ceil(G.T*2.0/Math.max(1.5, G.T*0.4)) + 1;
+  var r = G.T*0.9; r *= r;
+  for(var k=neck; k<G.ptN; k++){
+    if(dist2(G.ptsX[k], G.ptsY[k], G.hx, G.hy) < r){ die(); return; }
+  }
+  var er = G.T + G.CS*0.6;
+  if(dist2(G.hx, G.hy, G.fx, G.fy) < er*er) eat();
+  G.flash = Math.max(0, G.flash - dt*3);
+  var dm = Math.min(G.hx, G.hy, W-G.hx, H-G.hy);
+  var want = G.wrap ? 0 : Math.max(0, Math.min(1, 1 - dm/(G.CS*2.4)));
+  G.danger += (want - G.danger) * 0.25;
+}
+
+var PAL = ['255,215,110','255,130,70','190,255,140','255,250,225',
+           '255,95,95','255,170,70','130,255,130'];
+function spawnBurst(x, y, count, palOff, sMin, sMax, lMin, lMax, rMax){
+  if(G.parts.length > 190) return;
+  for(var i=0;i<count;i++){
+    var a = Math.random()*TAU, s = sMin + Math.random()*(sMax-sMin);
+    G.parts.push({ x:x, y:y, vx:Math.cos(a)*s, vy:Math.sin(a)*s,
+                   life:lMin + Math.random()*(lMax-lMin), max:lMax,
+                   ci:palOff + (i % 4), r:1 + Math.random()*rMax });
+  }
+}
+function eat(){
+  var demo = (G.state === 'ready');
+  var add = 10 + Math.round(G.speed/G.spd0*5);
+  if(!demo){
+    G.score += add;
+    if(G.score > G.best){ G.best = G.score; try{ localStorage.setItem('hyperSnakeBest',''+G.best); }catch(e){} }
+  }
+  G.bodyLen += G.CS*1.8;
+  G.speed = Math.min(G.spd0*2.8, G.speed*1.05);
+  G.flash = 1; G.shake = Math.min(14, G.shake + 7);
+  G.rings.push({ x:G.fx, y:G.fy, t:0, c:'255,180,70' });
+  spawnBurst(G.fx, G.fy, 26, 0, 60, 320, 0.5, 1.2, 2.6);
+  G.pops.push({ x:G.fx, y:G.fy-10, t:1, s:'+'+add });
+  if(!demo){
+    beep(520+Math.random()*90, 0.11, 'triangle', 0.10);
+    setTimeout(function(){ beep(760, 0.09, 'triangle', 0.07); }, 70);
+    if(navigator.vibrate) navigator.vibrate(24);
+  }
+  spawnFood();
+}
+function die(){
+  if(G.state === 'ready'){ reset(false); return; }
+  G.state = 'dead'; G.deadT = 0; G.shake = 18; G.danger = 1;
+  G.rings.push({ x:G.hx, y:G.hy, t:0, c:'255,80,80' });
+  spawnBurst(G.hx, G.hy, 44, 4, 50, 380, 0.6, 1.5, 3);
+  beep(180, 0.4, 'sawtooth', 0.12);
+  setTimeout(function(){ beep(90, 0.5, 'sine', 0.12); }, 120);
+  if(navigator.vibrate) navigator.vibrate([40,60,120]);
+  if(G.score > G.best){ G.best = G.score; try{ localStorage.setItem('hyperSnakeBest',''+G.best); }catch(e){} }
+  setTimeout(gameOver, 900);
+}
+function updateFx(dt){
+  var i, p;
+  for(i=G.parts.length-1;i>=0;i--){
+    p = G.parts[i];
+    p.x += p.vx*dt; p.y += p.vy*dt;
+    p.vx *= 0.93; p.vy = p.vy*0.93 + 320*dt;
+    p.life -= dt;
+    if(p.life <= 0){ G.parts[i] = G.parts[G.parts.length-1]; G.parts.pop(); }
+  }
+  for(i=G.rings.length-1;i>=0;i--){ G.rings[i].t += dt*1.9; if(G.rings[i].t > 1.1) G.rings.splice(i,1); }
+  for(i=G.pops.length-1;i>=0;i--){
+    p = G.pops[i]; p.y -= 55*dt; p.t -= dt*1.2;
+    if(p.t <= 0) G.pops.splice(i,1);
+  }
+  if(G.hitT > 0) G.hitT = Math.max(0, G.hitT - dt*1.5);
+}
+
+/* ---------- отрисовка ---------- */
+function draw(){
+  // фон: 1:1 блит без масштабирования
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.drawImage(bg, 0, 0);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+
+  var sh = G.shake;
+  if(sh > 0.4){
+    ctx.save();
+    ctx.translate((Math.random()-0.5)*sh, (Math.random()-0.5)*sh);
+  }
+  var pulse = 0.55 + 0.45*Math.sin(G.t*3.4);
+  light(G.fx, G.fy, G.CS*4.2, '255,150,40', 0.16+0.09*pulse);
+  light(G.hx, G.hy, G.CS*2.4, '130,255,160', 0.09+0.05*pulse);
+  if(G.flash > 0.02) light(G.hx, G.hy, G.CS*7, '255,225,150', G.flash*0.35);
+
+  var i;
+  for(i=0;i<G.rings.length;i++){
+    var r = G.rings[i];
+    ctx.beginPath(); ctx.arc(r.x, r.y, 8 + r.t*G.CS*3.2, 0, TAU);
+    ctx.strokeStyle = 'rgb('+r.c+')';
+    ctx.globalAlpha = Math.max(0, 0.6 - r.t*0.55);
+    ctx.lineWidth = Math.max(0.5, 4 - r.t*3);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  drawParticles();
+  drawBorderDanger();
+  drawApple();
+  drawSnake();
+
+  if(G.pops.length){
+    ctx.textAlign = 'center';
+    ctx.font = '900 '+Math.round(G.CS*0.6)+'px Segoe UI, sans-serif';
+    for(i=0;i<G.pops.length;i++){
+      var q = G.pops[i];
+      ctx.globalAlpha = Math.max(0, q.t);
+      ctx.fillStyle = '#fff0b4';
+      ctx.fillText(q.s, q.x, q.y);
+    }
+    ctx.globalAlpha = 1;
+  }
+  if(sh > 0.4) ctx.restore();
+  G.shake *= 0.86;
+}
+
+/* частицы: батчим по (цвет, уровень альфы) — 4-12 fill'ов вместо сотни */
+var pBucketIds = [], pBucketPaths = [];
+function drawParticles(){
+  var n = G.parts.length;
+  if(!n) return;
+  pBucketIds.length = 0; pBucketPaths.length = 0;
+  for(var i=0;i<n;i++){
+    var p = G.parts[i];
+    var a = p.life/p.max; if(a < 0) a = 0; else if(a > 1) a = 1;
+    var id = p.ci*4 + (a > 0.75 ? 3 : (a > 0.5 ? 2 : (a > 0.25 ? 1 : 0)));
+    var bi = pBucketIds.indexOf(id);
+    if(bi < 0){ bi = pBucketIds.length; pBucketIds.push(id); pBucketPaths.push(new Path2D()); }
+    var path = pBucketPaths[bi];
+    var rr = p.r*(0.4+a);
+    path.moveTo(p.x+rr, p.y);
+    path.arc(p.x, p.y, rr, 0, TAU);
+  }
+  ctx.globalCompositeOperation = 'lighter';
+  for(i=0;i<pBucketIds.length;i++){
+    var id2 = pBucketIds[i];
+    ctx.globalAlpha = [0.18, 0.45, 0.72, 0.95][(id2 % 4)];
+    ctx.fillStyle = 'rgb('+PAL[(id2/4)|0]+')';
+    ctx.fill(pBucketPaths[i]);
+  }
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+/* красная рамка, когда голова у самого края */
+function drawBorderDanger(){
+  if(G.danger <= 0.02 || G.wrap) return;
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = G.danger*0.55;
+  ctx.strokeStyle = '#ff4646'; ctx.lineWidth = 9; ctx.stroke(borderPath);
+  ctx.globalAlpha = G.danger*0.9;
+  ctx.strokeStyle = '#ffb0a0'; ctx.lineWidth = 2; ctx.stroke(borderPath);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  if(G.hitT > 0 && G.hitGrad){
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = G.hitT*0.75;
+    ctx.fillStyle = G.hitGrad;
+    ctx.fillRect(0, 0, W, H);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = 'source-over';
+  }
+}
+function makeHitGrad(){
+  var d = Math.min(140, G.CS*4), g;
+  if(G.hitEdge === 0)      g = ctx.createLinearGradient(0,0,d,0);
+  else if(G.hitEdge === 2) g = ctx.createLinearGradient(W,0,W-d,0);
+  else if(G.hitEdge === 1) g = ctx.createLinearGradient(0,0,0,d);
+  else                     g = ctx.createLinearGradient(0,H,0,H-d);
+  g.addColorStop(0,'rgba(255,90,70,0.85)');
+  g.addColorStop(1,'rgba(255,90,70,0)');
+  G.hitGrad = g;
+}
+
+/* яблоко: пред-рендер в спрайт */
+function appleSprite(){
+  var R = G.CS*0.5, key = R.toFixed(1)+'|'+DPR;
+  if(appleC && appleKey === key) return;
+  var S = Math.ceil(R*5), px = Math.max(4, Math.ceil(S*DPR));
+  var c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  var g = c.getContext('2d');
+  g.setTransform(DPR,0,0,DPR,0,0);
+  g.translate(S/2, S*0.62);
+  g.lineCap = 'round';
+  g.fillStyle = 'rgba(0,0,0,0.35)';
+  g.beginPath(); g.ellipse(2, R*0.95, R*0.85, R*0.3, 0, 0, TAU); g.fill();
+  var rg = g.createRadialGradient(-R*0.35,-R*0.4,R*0.08, 0,0,R*1.2);
+  rg.addColorStop(0,'#ffb0a0'); rg.addColorStop(0.35,'#ef3b2f'); rg.addColorStop(0.8,'#b8131a'); rg.addColorStop(1,'#71060c');
+  g.fillStyle = rg; g.beginPath(); g.arc(0,0,R,0,TAU); g.fill();
+  var hg = g.createRadialGradient(-R*0.36,-R*0.42,0,-R*0.36,-R*0.42,R*0.42);
+  hg.addColorStop(0,'rgba(255,255,255,0.95)'); hg.addColorStop(1,'rgba(255,255,255,0)');
+  g.fillStyle = hg; g.beginPath(); g.ellipse(-R*0.34,-R*0.4,R*0.32,R*0.24,-0.5,0,TAU); g.fill();
+  g.strokeStyle = '#6b4423'; g.lineWidth = Math.max(2, R*0.14);
+  g.beginPath(); g.moveTo(0,-R*0.85); g.quadraticCurveTo(R*0.1,-R*1.25,R*0.28,-R*1.45); g.stroke();
+  var lg = g.createLinearGradient(R*0.2,-R*1.4,R*1.1,-R*1.0);
+  lg.addColorStop(0,'#8ce06a'); lg.addColorStop(1,'#2f8f3d');
+  g.fillStyle = lg;
+  g.beginPath(); g.moveTo(R*0.3,-R*1.35);
+  g.bezierCurveTo(R*0.75,-R*1.85, R*1.25,-R*1.4, R*0.95,-R*0.95);
+  g.bezierCurveTo(R*0.6,-R*0.85, R*0.35,-R*1.05, R*0.3,-R*1.35); g.fill();
+  g.strokeStyle = 'rgba(255,255,255,0.25)'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(R*0.35,-R*1.3); g.quadraticCurveTo(R*0.7,-R*1.35,R*0.9,-R*1.0); g.stroke();
+  appleC = c; appleS = S; appleKey = key;
+}
+
+/* голова: пред-рендер (язык рисуем отдельно — он анимирован) */
+function headSprite(){
+  var T = G.T*2.1, key = T.toFixed(1)+'|'+DPR;
+  if(headC && headKey === key) return;
+  var S = Math.ceil(T*3.4), px = Math.max(4, Math.ceil(S*DPR));
+  var c = document.createElement('canvas');
+  c.width = px; c.height = px;
+  var g = c.getContext('2d');
+  g.setTransform(DPR,0,0,DPR,0,0);
+  g.translate(S/2, S/2);
+  g.lineCap = 'round';
+  g.fillStyle = 'rgba(0,0,0,0.35)';
+  g.beginPath(); g.ellipse(3,5,T*0.75,T*0.62,0,0,TAU); g.fill();
+  var lg = g.createLinearGradient(-T*0.6,-T*0.7,T*0.9,T*0.7);
+  lg.addColorStop(0,'#d6ff9e'); lg.addColorStop(0.4,'#93e464'); lg.addColorStop(1,'#3f9c53');
+  g.fillStyle = lg;
+  g.beginPath();
+  g.moveTo(T*1.05,0);
+  g.bezierCurveTo(T*1.02,-T*0.55, T*0.25,-T*0.78, -T*0.42,-T*0.62);
+  g.bezierCurveTo(-T*0.92,-T*0.48, -T*0.92,T*0.48, -T*0.42,T*0.62);
+  g.bezierCurveTo(T*0.25,T*0.78, T*1.02,T*0.55, T*1.05,0);
+  g.closePath(); g.fill();
+  for(var s=-1;s<=1;s+=2){
+    var ex = T*0.34, ey = s*T*0.46;
+    g.fillStyle = '#f6fbf0';
+    g.beginPath(); g.ellipse(ex,ey,T*0.26,T*0.24,0,0,TAU); g.fill();
+    g.strokeStyle = 'rgba(20,60,30,0.5)'; g.lineWidth = 1; g.stroke();
+    var pg = g.createRadialGradient(ex+T*0.05,ey-T*0.04,0,ex,ey,T*0.13);
+    pg.addColorStop(0,'#3b6b2e'); pg.addColorStop(1,'#0d1a0c');
+    g.fillStyle = pg;
+    g.beginPath(); g.ellipse(ex+T*0.04,ey,T*0.09,T*0.17,0,0,TAU); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.92)';
+    g.beginPath(); g.arc(ex-T*0.07,ey-T*0.09,T*0.055,0,TAU); g.fill();
+  }
+  g.fillStyle = 'rgba(20,50,25,0.55)';
+  g.beginPath(); g.arc(T*0.78,-T*0.18,T*0.05,0,TAU); g.fill();
+  g.beginPath(); g.arc(T*0.78, T*0.18,T*0.05,0,TAU); g.fill();
+  g.strokeStyle = 'rgba(20,60,30,0.35)'; g.lineWidth = Math.max(1,T*0.045);
+  g.beginPath(); g.moveTo(T*0.92,0);
+  g.quadraticCurveTo(T*0.4,T*0.34, -T*0.1,T*0.3); g.stroke();
+  g.globalCompositeOperation = 'lighter';
+  var hg = g.createLinearGradient(0,-T*0.7,0,0);
+  hg.addColorStop(0,'rgba(255,255,220,0.35)'); hg.addColorStop(1,'rgba(255,255,220,0)');
+  g.fillStyle = hg;
+  g.beginPath(); g.ellipse(T*0.1,-T*0.34,T*0.62,T*0.20,-0.12,0,TAU); g.fill();
+  headC = c; headS = S; headKey = key;
+}
+
+/* тело: пути собираются один раз и переиспользуются во всех проходах */
+var fineP = [], fineU = [], coarseP = [], coarseU = [], seam2 = 1e9;
+function buildInto(arrP, arrU, Kmax){
+  arrP.length = 0; arrU.length = 0;
+  var n = G.ptN;
+  if(n < 2) return;
+  var K = Math.max(3, Math.min(Kmax, Math.round(n/4)));
+  var px = G.ptsX, py = G.ptsY;
+  for(var c=0;c<K;c++){
+    var i0 = Math.floor(c*n/K), i1 = Math.min(n-1, Math.floor((c+1)*n/K)+1);
+    if(i1 <= i0) continue;
+    var p = new Path2D();
+    p.moveTo(px[i0], py[i0]);
+    for(var i=i0+1;i<=i1;i++){
+      var dx = px[i]-px[i-1], dy = py[i]-py[i-1];
+      if(dx*dx + dy*dy > seam2) p.moveTo(px[i], py[i]);   // шов тора — не тянем линию через экран
+      else p.lineTo(px[i], py[i]);
+    }
+    arrP.push(p); arrU.push((c+0.5)/K);
+  }
+}
+var BODY_STOPS = [[182,242,106],[127,212,78],[79,174,85],[47,138,88],[30,106,78]];
+var bodyCols = [];
+function bodyCol(u){
+  var s = BODY_STOPS, p = u*(s.length-1);
+  var i = Math.min(s.length-2, p|0), f = p-i;
+  return 'rgb('+((s[i][0]+(s[i+1][0]-s[i][0])*f)|0)+','+
+                 ((s[i][1]+(s[i+1][1]-s[i][1])*f)|0)+','+
+                 ((s[i][2]+(s[i+1][2]-s[i][2])*f)|0)+')';
+}
+function drawSnake(){
+  var n = G.ptN;
+  if(n < 2) return;
+  var px = G.ptsX, py = G.ptsY;
+  var breathe = 1 + 0.035*Math.sin(G.t*3.0);
+  seam2 = G.wrap ? (Math.min(W,H)*0.5)*(Math.min(W,H)*0.5) : 1e18;
+  buildInto(fineP, fineU, 14);
+  buildInto(coarseP, coarseU, 6);
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  var i, u, w;
+
+  // тень
+  ctx.save(); ctx.translate(4,7);
+  ctx.strokeStyle = 'rgba(0,0,0,0.34)';
+  for(i=0;i<fineP.length;i++){
+    u = fineU[i];
+    ctx.lineWidth = G.T*2*(1.05-0.6*u)*breathe + 7;
+    ctx.stroke(fineP[i]);
+  }
+  ctx.restore();
+
+  // тело
+  for(i=0;i<fineP.length;i++){
+    u = fineU[i];
+    ctx.lineWidth = G.T*2*(1.05-0.6*u)*breathe;
+    ctx.strokeStyle = bodyCol(u);
+    ctx.stroke(fineP[i]);
+  }
+
+  // брюхо (грубые сегменты — визуально то же, проходов меньше)
+  ctx.save(); ctx.translate(0, G.T*0.42);
+  ctx.strokeStyle = 'rgba(215,240,170,0.30)';
+  for(i=0;i<coarseP.length;i++){
+    u = coarseU[i];
+    ctx.lineWidth = G.T*2*(1.02-0.6*u)*breathe*0.55;
+    ctx.stroke(coarseP[i]);
+  }
+  ctx.restore();
+
+  // чешуя: ОДИН путь на все чешуйки -> 1 fill + 1 stroke вместо сотни
+  var step = G.CS*0.5, acc = 0;
+  var scaleFill = null, scaleLine = null, any = false;
+  for(i=1;i<n-1;i++){
+    var d = Math.sqrt(dist2(px[i], py[i], px[i+1], py[i+1]));
+    acc += d;
+    if(acc < step) continue;
+    acc = 0;
+    if(!(i % 2)) continue;
+    u = i/n;
+    var ang = Math.atan2(wdy(py[i+1]-py[i]), wdx(px[i+1]-px[i]));
+    w = G.T*2*(1.05-0.6*u)*breathe;
+    var rx = w*0.34, ry = w*0.42;
+    if(!any){ scaleFill = new Path2D(); scaleLine = new Path2D(); any = true; }
+    scaleFill.moveTo(px[i] + rx*Math.cos(ang), py[i] + rx*Math.sin(ang));
+    scaleFill.ellipse(px[i], py[i], rx, ry, ang, 0, TAU);
+    scaleLine.moveTo(px[i] + rx*Math.cos(ang), py[i] + rx*Math.sin(ang));
+    scaleLine.ellipse(px[i], py[i], rx, ry, ang, 0, TAU);
+  }
+  if(any){
+    ctx.fillStyle = 'rgba(12,40,26,0.30)'; ctx.fill(scaleFill);
+    ctx.strokeStyle = 'rgba(230,255,210,0.14)'; ctx.lineWidth = 1; ctx.stroke(scaleLine);
+  }
+
+  // блик по хребту
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.translate(-G.T*0.30, -G.T*0.40);
+  ctx.strokeStyle = 'rgba(225,255,205,0.35)';
+  for(i=0;i<coarseP.length;i++){
+    u = coarseU[i];
+    ctx.lineWidth = Math.max(1, G.T*2*(1.02-0.6*u)*breathe*0.16);
+    ctx.stroke(coarseP[i]);
+  }
+  ctx.restore();
+
+  drawHead(px, py, n);
+}
+function drawHead(px, py, n){
+  var j = Math.min(3, n-1);
+  var ang = Math.atan2(wdy(py[0]-py[j]), wdx(px[0]-px[j]));
+  var T = G.T*2.1;
+  headSprite();
+  ctx.save();
+  ctx.translate(px[0], py[0]);
+  ctx.rotate(ang);
+  ctx.drawImage(headC, -headS/2, -headS/2, headS, headS);
+  if(Math.sin(G.t*6.0) > 0.55){
+    var ext = T*0.55;
+    ctx.strokeStyle = '#ff5c86'; ctx.lineWidth = Math.max(1.6, T*0.09); ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(T*0.95, 0); ctx.lineTo(T*0.95+ext*0.6, 0);
+    ctx.moveTo(T*0.95+ext*0.6, 0); ctx.lineTo(T*0.95+ext, -T*0.16);
+    ctx.moveTo(T*0.95+ext*0.6, 0); ctx.lineTo(T*0.95+ext, T*0.16);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawApple(){
+  appleSprite();
+  var bob = Math.sin(G.t*2.2)*4, sc = 1 + 0.05*Math.sin(G.t*5.1);
+  ctx.save();
+  ctx.translate(G.fx, G.fy + bob);
+  if(sc !== 1) ctx.scale(sc, sc);
+  ctx.drawImage(appleC, -appleS/2, -appleS*0.62, appleS, appleS);
+  ctx.restore();
+}
+
+/* ---------- HUD ---------- */
+var lSc = -1, lBs = -1, lLn = -1, lSp = '';
+function hud(){
+  if(G.score !== lSc){
+    lSc = G.score; elSc.textContent = G.score;
+    var chip = elSc.parentNode;
+    chip.classList.remove('pop'); void chip.offsetWidth; chip.classList.add('pop');
+  }
+  if(G.best !== lBs){ lBs = G.best; elBs.textContent = G.best; }
+  var ln = Math.round(G.bodyLen/G.CS);
+  if(ln !== lLn){ lLn = ln; elLn.textContent = ln; }
+  var sp = (G.speed/G.spd0).toFixed(1)+'x';
+  if(sp !== lSp){ lSp = sp; elSp.textContent = sp; }
+}
+function fpsHud(ms){
+  fpsAcc += ms; fpsN++;
+  if(fpsAcc >= 260){
+    fpsShow = Math.round(1000/(fpsAcc/fpsN));
+    elFp.textContent = fpsShow;
+    fpsAcc = 0; fpsN = 0;
+  }
+}
+
+/* ---------- оверлеи ---------- */
+function wrapBtn(){
+  return '<button class="btn ghost" id="wt">СТЕНЫ: ' + (G.wrap ? 'НАСКВОЗЬ' : 'СМЕРТЕЛЬНЫЕ') + '</button>';
+}
+function bindCommon(){
+  var w = document.getElementById('wt');
+  if(w) w.onclick = function(){
+    G.wrap = !G.wrap;
+    w.textContent = 'СТЕНЫ: ' + (G.wrap ? 'НАСКВОЗЬ' : 'СМЕРТЕЛЬНЫЕ');
+    toast(G.wrap ? 'Стены проходимы: вылетаешь с одной стороны — влетаешь с другой'
+                 : 'Стены смертельны: удар о край экрана');
+  };
+}
+function startScreen(){
+  card.innerHTML = '<div class="ttl">HYPER<br>SNAKE</div>' +
+    '<div class="sub">TERMUX EDITION</div>' +
+    '<div class="big">'+G.best+'</div><div class="lbl">РЕКОРД</div>' +
+    '<div class="keys">' + (!SHOW_PAD
+        ? '<kbd>СВАЙП</kbd><kbd>ТАП — СТАРТ</kbd>'
+        : '<kbd>&#8593;</kbd><kbd>&#8595;</kbd><kbd>&#8592;</kbd><kbd>&#8594;</kbd><kbd>W A S D</kbd><kbd>КЛИК МЫШЬЮ</kbd><kbd>SPACE</kbd><kbd>R</kbd>') +
+    '</div>' +
+    '<button class="btn" id="go">ИГРАТЬ</button>' + wrapBtn() +
+    '<div class="note">Свечение, частицы, вибрация и звук &middot; один файл для терминала и браузера<br>' +
+    'Граница поля = край экрана</div>';
+  ov.classList.remove('hidden');
+  document.getElementById('go').onclick = begin;
+  bindCommon();
+}
+function gameOver(){
+  if(G.state !== 'dead') return;
+  card.innerHTML = '<div class="sub">ИГРА ОКОНЧЕНА</div>' +
+    '<div class="big">'+G.score+'</div><div class="lbl">ОЧКОВ</div>' +
+    '<div class="note">Длина: '+Math.round(G.bodyLen/G.CS)+' &middot; Рекорд: '+G.best+'</div>' +
+    '<button class="btn" id="again">ЕЩЁ РАЗ</button>' + wrapBtn() +
+    '<div class="note">или нажми R</div>';
+  ov.classList.remove('hidden');
+  document.getElementById('again').onclick = begin;
+  bindCommon();
+}
+function showPause(){
+  card.innerHTML = '<div class="sub">ПАУЗА</div><div class="big">'+G.score+'</div>' +
+    '<div class="lbl">ОЧКОВ</div><button class="btn" id="res">ПРОДОЛЖИТЬ</button>' + wrapBtn();
+  ov.classList.remove('hidden');
+  document.getElementById('res').onclick = togglePause;
+  bindCommon();
+}
+function begin(){
+  ov.classList.add('hidden');
+  if(document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  reset(true);
+  G.state = 'play';
+  beep(660, 0.09, 'triangle', 0.09);
+}
+function togglePause(){
+  if(G.state === 'play'){ G.state = 'pause'; showPause(); }
+  else if(G.state === 'pause'){ G.state = 'play'; ov.classList.add('hidden'); }
+}
+/* пункт 2: клик по фону не убивает прогресс — на паузе он просто снимает паузу */
+ov.addEventListener('click', function(e){
+  if(e.target !== ov) return;
+  if(G.state === 'pause') togglePause();
+  else if(G.state === 'ready' || G.state === 'dead') begin();
+});
+
+/* ---------- ввод ---------- */
+var rArm = 0;
+document.addEventListener('keydown', function(e){
+  var k = e.key, now = performance.now();
+  if(k === 'ArrowUp'   || k === 'w' || k === 'W' || k === 'k'){ steer(0,-1); e.preventDefault(); }
+  else if(k === 'ArrowDown' || k === 's' || k === 'S' || k === 'j'){ steer(0,1); e.preventDefault(); }
+  else if(k === 'ArrowLeft' || k === 'a' || k === 'A' || k === 'h'){ steer(-1,0); e.preventDefault(); }
+  else if(k === 'ArrowRight'|| k === 'd' || k === 'D' || k === 'l'){ steer(1,0); e.preventDefault(); }
+  else if(k === ' '){
+    e.preventDefault();
+    if(G.state === 'ready' || G.state === 'dead') begin(); else togglePause();
+  }
+  else if(k === 'r' || k === 'R'){
+    if(G.state === 'play'){
+      if(now - rArm < 1300){ rArm = 0; begin(); }
+      else { rArm = now; toast('Нажми R ещё раз, чтобы начать заново'); }
+    } else begin();
+  }
+  else if(k === 'Escape'){
+    if(G.state === 'play') togglePause();
+  }
+  else if(k === 'f' || k === 'F'){ qchip.click(); }
+});
+/* мышь на десктопе: клик — поворот в сторону курсора */
+cv.addEventListener('mousedown', function(e){
+  if(IS_TOUCH) return;
+  if(G.state === 'ready' || G.state === 'dead'){ begin(); return; }
+  if(G.state !== 'play') return;
+  var dx = e.clientX - G.hx, dy = e.clientY - G.hy;
+  if(Math.abs(dx) > Math.abs(dy)) steer(dx > 0 ? 1 : -1, 0);
+  else steer(0, dy > 0 ? 1 : -1);
+});
+var tsx = 0, tsy = 0, tmoved = false;
+cv.addEventListener('touchstart', function(e){
+  var t = e.touches[0]; tsx = t.clientX; tsy = t.clientY; tmoved = false;
+}, {passive:true});
+cv.addEventListener('touchmove', function(e){
+  if(tmoved) return;
+  var t = e.touches[0], dx = t.clientX - tsx, dy = t.clientY - tsy;
+  if(dx*dx + dy*dy < 625) return;
+  tmoved = true;
+  if(Math.abs(dx) > Math.abs(dy)) steer(dx > 0 ? 1 : -1, 0);
+  else steer(0, dy > 0 ? 1 : -1);
+}, {passive:true});
+cv.addEventListener('touchend', function(){
+  if(!tmoved && (G.state === 'ready' || G.state === 'dead')) begin();
+}, {passive:true});
+
+var pbs = pad.querySelectorAll('.pb');
+for(var i=0;i<pbs.length;i++){
+  (function(b){
+    var f = function(ev){
+      ev.preventDefault();
+      var d = b.getAttribute('data-d');
+      if(d === 'p'){ togglePause(); return; }
+      if(G.state === 'ready' || G.state === 'dead') begin();
+      if(G.state !== 'play') return;
+      var p = d.split(',');
+      steer(parseInt(p[0],10), parseInt(p[1],10));
+    };
+    b.addEventListener('touchstart', f, {passive:false});
+    b.addEventListener('mousedown', f);
+  })(pbs[i]);
+}
+
+/* ---------- главный цикл ---------- */
+var last = performance.now();
+function frame(now){
+  var ms = now - last; last = now;
+  if(ms > 0) adapt(ms);
+  var dt = ms > 50 ? 0.05 : ms/1000;
+  G.t += dt;
+
+  if(G.state === 'play' || G.state === 'ready'){
+    if(G.state === 'ready') ai();
+    move(dt*0.5); move(dt*0.5);        // два лёгких подшага
+    bodyPoints();                      // тело — один раз за кадр
+    checks(dt);                        // столкновения и еда — один раз за кадр
+  } else if(G.state === 'dead'){
+    G.deadT += dt;
+  }
+  updateFx(dt);
+  if(G.hitT > 0 && !G.hitGrad) makeHitGrad();
+  draw();
+  hud();
+  fpsHud(ms);
+  requestAnimationFrame(frame);
+}
+
+resize();
+if(!G.CS) reset(true);
+bodyPoints();
+startScreen();
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def save_html(path):
+    with open(path, 'w', encoding='utf-8') as fh:
+        fh.write(HTML)
+    return path
+
+
+def web_mode():
+    p = save_html(os.path.join(HERE, 'snake.html'))
+    import http.server, socketserver, threading, webbrowser
+
+    def handler(*a, **kw):
+        kw.setdefault('directory', HERE)
+        return http.server.SimpleHTTPRequestHandler(*a, **kw)
+
+    socketserver.TCPServer.allow_reuse_address = True
+    port = 8765
+    try:
+        httpd = socketserver.TCPServer(('127.0.0.1', port), handler)
+    except Exception:
+        httpd = socketserver.TCPServer(('127.0.0.1', 0), handler)
+    port = httpd.server_address[1]
+    url = 'http://127.0.0.1:%d/snake.html' % port
+    print(ESC + '[1;32m[web]' + ESC + '[0m HTML5-версия: ' + p)
+    print(ESC + '[1;36m[web]' + ESC + '[0m открываю ' + url + '  (Ctrl+C — остановить сервер)')
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    op = shutil.which('termux-open-url') or shutil.which('xdg-open') or shutil.which('am')
+    try:
+        if op == shutil.which('termux-open-url'):
+            subprocess.Popen([op, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print('\n[web] сервер остановлен')
+    httpd.shutdown()
+    return 0
+
+
+# ============================ 7. MAIN ============================
+def main(argv):
+    if '-h' in argv or '--help' in argv:
+        print(HELP)
+        return 0
+    if '--save-html' in argv:
+        i = argv.index('--save-html')
+        path = argv[i + 1] if i + 1 < len(argv) else 'snake.html'
+        save_html(path)
+        print('сохранено: ' + path)
+        return 0
+    if '--web' in argv or '--html' in argv:
+        return web_mode()
+    if '--check' in argv:
+        return 0 if bootstrap('check') else 1
+    if not bootstrap('auto' if '--no-install' not in argv else 'skip'):
+        return 1
+    return run_cli(argv)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
